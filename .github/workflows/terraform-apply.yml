@@ -1,0 +1,211 @@
+# =============================================================================
+# terraform-apply.yml
+# Continuous Deployment workflow for Terraform.
+# Triggers only on push to main (i.e., after a PR is merged).
+# - Dev:  applies automatically after a successful plan.
+# - Prod: requires manual approval via a GitHub environment protection rule.
+# Uses OIDC to authenticate with AWS — no stored credentials required.
+# =============================================================================
+
+name: Terraform Apply
+
+on:
+  push:
+    branches:
+      - main
+
+# Only one apply should run at a time per environment.
+concurrency:
+  group: terraform-apply-${{ github.ref }}
+  cancel-in-progress: false  # Never cancel an in-flight apply
+
+permissions:
+  id-token: write   # Required for OIDC token request
+  contents: read    # Required to checkout the repository
+
+env:
+  TF_VERSION: "1.13.0"
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Apply to Dev
+  # Automatically applies Terraform changes to the dev environment on every
+  # merge to main.
+  # ---------------------------------------------------------------------------
+  apply-dev:
+    name: "Terraform Apply (dev)"
+    runs-on: ubuntu-24.04
+    environment: dev  # Maps to GitHub environment "dev" (optional protection rules)
+
+    defaults:
+      run:
+        working-directory: environments/dev
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065  # v3.1.2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure Terraform plugin cache directory
+        run: |
+          mkdir -p ~/.terraform.d/plugin-cache
+          echo 'plugin_cache_dir = "$HOME/.terraform.d/plugin-cache"' > ~/.terraformrc
+
+      - name: Restore Terraform provider cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: |
+            ~/.terraform.d/plugin-cache
+            environments/dev/.terraform
+          key: terraform-providers-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            terraform-providers-${{ runner.os }}-
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: TerraformApplyDev
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -input=false -out=tfplan.binary 2>&1 | tee plan_output.txt
+
+      # Security note: In a stricter setup, the plan binary would be produced
+      # in the CI workflow, saved as a signed artifact, and consumed here.
+      # That prevents any drift between the reviewed plan and what gets applied.
+      # Current approach (plan + apply in same job) is acceptable for a single
+      # engineer workflow but should be reviewed for team environments.
+
+      - name: Terraform Apply
+        id: apply
+        run: terraform apply -no-color -input=false tfplan.binary 2>&1 | tee apply_output.txt
+
+      - name: Write Apply Summary
+        if: always()
+        run: |
+          echo "## 🚀 Terraform Apply — \`dev\` environment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ${{ steps.apply.outcome == 'success' && '✅ Success' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered by** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Run ID** | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<details>" >> $GITHUB_STEP_SUMMARY
+          echo "<summary>📋 Apply Output</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -100 apply_output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload plan artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: tfplan-dev-applied-${{ github.sha }}
+          path: environments/dev/tfplan.binary
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Apply to Prod
+  # Requires manual approval via the "prod" GitHub environment protection rule.
+  # Only runs after dev apply succeeds.
+  # ---------------------------------------------------------------------------
+  apply-prod:
+    name: "Terraform Apply (prod)"
+    runs-on: ubuntu-24.04
+    needs: apply-dev
+    environment: prod  # IMPORTANT: Configure "prod" env in GitHub → Settings → Environments
+                       # Add required reviewers to enforce manual approval gate.
+
+    defaults:
+      run:
+        working-directory: environments/prod
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065  # v3.1.2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure Terraform plugin cache directory
+        run: |
+          mkdir -p ~/.terraform.d/plugin-cache
+          echo 'plugin_cache_dir = "$HOME/.terraform.d/plugin-cache"' > ~/.terraformrc
+
+      - name: Restore Terraform provider cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: |
+            ~/.terraform.d/plugin-cache
+            environments/prod/.terraform
+          key: terraform-providers-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            terraform-providers-${{ runner.os }}-
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: TerraformApplyProd
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -input=false -out=tfplan.binary 2>&1 | tee plan_output.txt
+
+      # Security note: In a stricter setup, the plan binary would be produced
+      # in the CI workflow, saved as a signed artifact, and consumed here.
+      # That prevents any drift between the reviewed plan and what gets applied.
+      # Current approach (plan + apply in same job) is acceptable for a single
+      # engineer workflow but should be reviewed for team environments.
+
+      - name: Terraform Apply
+        id: apply
+        run: terraform apply -no-color -input=false tfplan.binary 2>&1 | tee apply_output.txt
+
+      - name: Write Apply Summary
+        if: always()
+        run: |
+          echo "## 🚀 Terraform Apply — \`prod\` environment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ${{ steps.apply.outcome == 'success' && '✅ Success' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered by** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Run ID** | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<details>" >> $GITHUB_STEP_SUMMARY
+          echo "<summary>📋 Apply Output</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -100 apply_output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload plan artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: tfplan-prod-applied-${{ github.sha }}
+          path: environments/prod/tfplan.binary
+          retention-days: 90

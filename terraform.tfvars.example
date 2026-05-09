@@ -1,0 +1,34 @@
+# =============================================================================
+# terraform.tfvars.example
+#
+# Copy this file to terraform.tfvars (gitignored) and fill in real values
+# before running terraform apply in any environment.
+#
+# Or pass values via environment variables:
+#   export TF_VAR_alarm_email="ops@example.com"
+# =============================================================================
+
+# ---- Shared across environments ----
+
+# Short name used as a prefix for all AWS resource names.
+# Convention: obs-platform  (used as obs-platform-dev-vpc, etc.)
+project_name = "obs-platform"
+
+# Target AWS region.
+aws_region = "eu-west-2"
+
+# ---- Dev-specific ----
+
+# Email to receive CloudWatch alarm notifications for dev.
+# Leave empty ("") to skip SNS email subscription.
+alarm_email = ""
+
+# ACM certificate ARN for HTTPS on the dev ALB.
+# Leave empty to use HTTP-only (fine for dev/testing).
+certificate_arn = ""
+
+# ---- Prod-specific (required — no defaults) ----
+# Uncomment and set when applying to prod:
+
+# alarm_email     = "platform-alerts@example.com"
+# certificate_arn = "arn:aws:acm:eu-west-2:123456789012:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
